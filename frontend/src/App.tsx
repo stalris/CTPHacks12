@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Chat } from './Chat';
 import { AnimatePresence, MotionConfig, motion } from 'motion/react';
-import type { AuditImport, AuditRequirement, Availability, Course, Prereqs, Program, Section, SuggestResponse, Suggestion, Term } from './types';
+import type { AuditImport, AuditRequirement, Availability, Course, Prereqs, Program, SchedulePreferenceProfile, Section, SuggestResponse, Suggestion, Term } from './types';
 import { COLS, DEGREE_CREDITS, GEOM, bandH, nextTerm, pos } from './plan';
 import './App.css';
 
@@ -29,8 +29,9 @@ const NO_AVAIL: Availability = { busy: [], earliest: 0, latest: 24 * 60 };
 const clock = (m: number) => `${((m / 60 | 0) - 1) % 12 + 1}:${`${m % 60}`.padStart(2, '0')}${m < 720 ? 'AM' : 'PM'}`;
 const hhmm = (m: number) => `${`${m / 60 | 0}`.padStart(2, '0')}:${`${m % 60}`.padStart(2, '0')}`;   // for <input type="time">
 const mins = (v: string) => { const [h, m] = v.split(':').map(Number); return h * 60 + m; };
-/** "TuTh 1:40PM–2:30PM" — what the student actually needs to read off a card. */
-const meets = (s: Section) => (s.start === null ? (s.raw || 'time TBA') : `${s.days} ${clock(s.start)}–${clock(s.end!)}`);
+/** Show the complete registration when a lecture has a linked lab/recitation. */
+const oneMeet = (s: Section) => (s.start === null ? (s.raw || 'time TBA') : `${s.days} ${clock(s.start)}–${clock(s.end!)}`);
+const meets = (s: Section) => s.components?.length ? s.components.map(oneMeet).join(' + ') : oneMeet(s);
 
 type CourseLocation =
   | { kind: 'term'; index: number }
@@ -44,6 +45,8 @@ type DraggedCourse = {
 
 type SubjectPreferences = { preferredSubjects: string[]; avoidedSubjects: string[] };
 const NO_PREFERENCES: SubjectPreferences = { preferredSubjects: [], avoidedSubjects: [] };
+const WEIGHT_LABELS: Record<string, string> = { campus_days: 'Fewer campus days', gap_minutes: 'Shorter gaps', early_minutes: 'Avoid early classes', late_minutes: 'Avoid late classes', campus_span_minutes: 'Shorter campus days' };
+const hours = (m: number | undefined) => `${Math.round(((m ?? 0) / 60) * 10) / 10}h`;
 
 const PanelIcon = ({ side }: { side: 'left' | 'right' }) => (
   <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
@@ -66,6 +69,12 @@ export default function App() {
   const [breaks, setBreaks] = useState(false);
   const [avail, setAvail] = useState<Availability>(() => store<Availability>('avail') ?? NO_AVAIL);
   const [preferences, setPreferences] = useState<SubjectPreferences>(() => store<SubjectPreferences>('preferences') ?? NO_PREFERENCES);
+  const [schedulePrompt, setSchedulePrompt] = useState<string>(() => store<string>('schedulePrompt') ?? '');
+  const [scheduleProfile, setScheduleProfile] = useState<SchedulePreferenceProfile | null>(() => store<SchedulePreferenceProfile>('scheduleProfile') ?? null);
+  const [scheduleIndex, setScheduleIndex] = useState(0);
+  const [preferenceLoading, setPreferenceLoading] = useState(false);
+  const [feedbackOpen, setFeedbackOpen] = useState(false);
+  const [scheduleFeedback, setScheduleFeedback] = useState('');
   const [terms, setTerms] = useState<Term[]>(() => store<Term[]>(`terms:${store('program') ?? 'CSCI-BS'}`) ?? []);
   const [proposal, setProposal] = useState<Suggestion[]>([]);
   // pins: courses locked into the current proposal (survive Generate with Gemini). queue: wanted later — promoted to a pin the first term they're eligible.
@@ -141,6 +150,7 @@ export default function App() {
   }, [pid]);
   useEffect(() => { store(`pins:${pid}`, pins); store(`queue:${pid}`, queue); store(`ignored:${pid}`, ignored); }, [pid, pins, queue, ignored]);
   useEffect(() => { store('ui:left', left); store('ui:right', right); }, [left, right]);
+  useEffect(() => { store('schedulePrompt', schedulePrompt); store('scheduleProfile', scheduleProfile); }, [schedulePrompt, scheduleProfile]);
   useEffect(() => {
     if (!notice.startsWith('Imported ')) return;
     const timer = window.setTimeout(() => setNotice(''), 8000);
@@ -171,6 +181,8 @@ export default function App() {
   const availNarrowed = avail.busy.length > 0 || avail.earliest > 0 || avail.latest < 24 * 60;
   /** True once we are past the term the registrar has published: times are then a season pattern, not a booking. */
   const pattern = resp?.schedule?.basis === 'pattern';
+  const scheduleOptions = resp?.optimizer?.schedules ?? [];
+  const activeSchedule = scheduleOptions[scheduleIndex] ?? null;
 
   // --- prerequisite status of a proposed course, mirroring server.py (placement, coreq, verified) ---
   const num = (id: string) => Number((courses.get(id)?.code.split(' ')[1] ?? '').match(/\d+/)?.[0] ?? 0);
@@ -187,13 +199,46 @@ export default function App() {
   const blocked = proposal.filter(p => !ignored.includes(p.id) && status(p.id, proposalIds) !== 'ok');
   const ignore = (id: string) => { if (!ignored.includes(id)) setIgnored([...ignored, id]); };
 
-  /** The server locks eligible pins + queued courses into the term first; here we just promote newly-eligible queued ones to pins. */
+  const proposalForSchedule = (r: SuggestResponse, index: number) => {
+    const schedule = r.optimizer?.schedules?.[index];
+    if (!schedule) return r.suggested;
+    const selected = new Map(schedule.sections.map(item => [item.course_id, item.section]));
+    const base = new Map<string, Suggestion>();
+    r.candidates.forEach(c => base.set(c.id, c));
+    r.suggested.forEach(c => base.set(c.id, c));
+    return r.candidates.filter(c => selected.has(c.id)).map(c => ({ ...(base.get(c.id) ?? c), sections: [selected.get(c.id)!] }));
+  };
+
+  /** Promote newly eligible queued courses to pins, and show optimizer schedule #1. */
   const merge = (r: SuggestResponse) => {
     const { pins, queue } = latest.current;
     const eligible = new Set(r.candidates.map(c => c.id));
     setPins([...new Set([...pins, ...queue])].filter(id => eligible.has(id)));
     setQueue(queue.filter(id => !eligible.has(id)));
-    return r.suggested;
+    setScheduleIndex(0); setFeedbackOpen(false);
+    return proposalForSchedule(r, 0);
+  };
+
+  const selectSchedule = (index: number) => {
+    if (!resp || index < 0 || index >= scheduleOptions.length) return;
+    setScheduleIndex(index); setProposal(proposalForSchedule(resp, index)); setFeedbackOpen(false); setScheduleFeedback('');
+  };
+
+  const interpretSchedulePreferences = async (feedback = '') => {
+    if (!schedulePrompt.trim() && !feedback.trim()) return setNotice('Tell Gemini what matters to you first.');
+    setPreferenceLoading(true); setError(''); setNotice('');
+    try {
+      const response = await fetch('/api/schedule-preferences', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ prompt: schedulePrompt, profile: scheduleProfile, feedback: feedback || undefined, scheduleMetrics: activeSchedule?.metrics }),
+      });
+      const data = await response.json();
+      if (!response.ok || data.error) throw new Error(data.error || `${response.status}`);
+      setScheduleProfile(data as SchedulePreferenceProfile); setScheduleIndex(0); setFeedbackOpen(false); setScheduleFeedback('');
+      setNotice(feedback ? 'Gemini updated the schedule priorities from your feedback.' : 'Gemini translated your schedule preferences.');
+    } catch (e) {
+      setError(`Schedule preference update failed (${e instanceof Error ? e.message : 'unknown error'}).`);
+    } finally { setPreferenceLoading(false); }
   };
 
   // ask the backend for the next semester whenever the approved terms change (pins/queue ride along). The automatic request is
@@ -206,7 +251,8 @@ export default function App() {
     const { pins, queue } = latest.current;
     const hasPreferences = preferences.preferredSubjects.length > 0 || preferences.avoidedSubjects.length > 0;
     const body = { program: pid, terms: terms.map(t => t.courses), term: current.kind, pins, queue, auditRequirements,
-                   fresh: fresh.current, ai: ai.current, avail: availNarrowed ? avail : null, preferences: hasPreferences ? preferences : undefined };
+                   fresh: fresh.current, ai: ai.current, avail: availNarrowed ? avail : null, preferences: hasPreferences ? preferences : undefined,
+                   scheduleProfile: scheduleProfile ?? undefined };
     fresh.current = false; ai.current = false;
     setLoading(true); setError('');
     fetch('/api/suggest', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: ctl.signal })
@@ -214,7 +260,7 @@ export default function App() {
       .then(r => { setResp(r); setProposal(merge(r)); setLoading(false); })
       .catch(e => { if (e.name !== 'AbortError') { setError(`Backend not reachable (${e.message}). Run: python backend/server.py`); setLoading(false); } });
     return () => ctl.abort();
-  }, [pid, taken, current.kind, !!program, avail, preferences, auditRequirements]);   // eslint-disable-line react-hooks/exhaustive-deps
+  }, [pid, taken, current.kind, !!program, avail, preferences, auditRequirements, scheduleProfile]);   // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { store('avail', avail); }, [avail]);
   useEffect(() => { store('preferences', preferences); }, [preferences]);
 
@@ -467,7 +513,7 @@ export default function App() {
                   <section className="p-4">
                     <div className="mb-3 flex items-baseline justify-between">
                       <h2 className="text-[14px] font-semibold">{current.name}</h2>
-                      <span className="text-[12px] text-ink-2 tabular-nums">{proposalCredits} cr · {resp.source === 'gemini' ? 'Gemini' : 'rule-based'}</span>
+                      <span className="text-[12px] text-ink-2 tabular-nums">{proposalCredits} cr · {resp.optimizer?.profile?.source === 'gemini' && resp.optimizer.applied ? 'Gemini-ranked' : resp.source === 'gemini' ? 'Gemini' : 'rule-based'}</span>
                     </div>
                     <ul className="mb-3 -mx-2">
                       <AnimatePresence initial={false}>
@@ -493,6 +539,24 @@ export default function App() {
                         })}
                       </AnimatePresence>
                     </ul>
+                    {resp.optimizer?.applied && scheduleOptions.length > 0 && activeSchedule && (
+                      <div className="mb-3 rounded-md border border-line bg-canvas p-2">
+                        <div className="mb-1 flex items-center justify-between gap-2">
+                          <div><b className="text-[12px] font-semibold">Ranked schedule {scheduleIndex + 1} of {scheduleOptions.length}</b>
+                            <p className="text-[11px] text-ink-3">{resp.optimizer.ranking === 'weighted-explored-pool' ? 'ordered by your schedule priorities' : 'conflict-free alternatives'}</p></div>
+                          <div className="flex gap-0.5">
+                            <button className={`${icon} h-6 w-6`} onClick={() => selectSchedule(scheduleIndex - 1)} disabled={scheduleIndex === 0} aria-label="Previous schedule">‹</button>
+                            <button className={`${icon} h-6 w-6`} onClick={() => selectSchedule(scheduleIndex + 1)} disabled={scheduleIndex >= scheduleOptions.length - 1} aria-label="Next schedule">›</button>
+                          </div>
+                        </div>
+                        <p className="text-[11px] text-ink-2 tabular-nums">{activeSchedule.metrics.campus_days ?? 0} campus days · {hours(activeSchedule.metrics.gap_minutes)} gaps · longest day {hours(activeSchedule.metrics.max_daily_span_minutes)}{activeSchedule.cost !== undefined && ` · score ${activeSchedule.cost.toFixed(2)}`}</p>
+                        <button className={`${btn} mt-1 h-6 px-0 text-[12px] text-ink-2`} onClick={() => setFeedbackOpen(v => !v)}>Not for me</button>
+                        {feedbackOpen && <div className="mt-1.5">
+                          <textarea className={`min-h-16 w-full resize-y rounded-md border border-line bg-canvas p-2 text-[12px] text-ink ${ring}`} value={scheduleFeedback} onChange={e => setScheduleFeedback(e.target.value)} placeholder="Why not? e.g. Too much waiting between classes, or I really don't want to come in on Friday." />
+                          <button className={`${primary} mt-1`} disabled={preferenceLoading || !scheduleFeedback.trim()} onClick={() => interpretSchedulePreferences(scheduleFeedback)}>{preferenceLoading ? 'Updating…' : 'Update priorities with Gemini'}</button>
+                        </div>}
+                      </div>
+                    )}
                     <div className="mb-1.5 flex gap-1">
                       <select className={`${field} min-w-0 flex-1`} aria-label="Filter by subject" value={filter.subject} onChange={e => setFilter({ ...filter, subject: e.target.value })}>
                         <option value="">All subjects</option>{subjects.map(s => <option key={s} value={s}>{s}</option>)}
@@ -502,6 +566,29 @@ export default function App() {
                       </select>
                     </div>
                     <label className={`${btn} mb-1.5 cursor-pointer font-normal text-ink-2`}><input type="checkbox" className="accent-accent" checked={filter.eligible} onChange={e => setFilter({ ...filter, eligible: e.target.checked })} /> Eligible now only</label>
+                    <details className="mb-1.5">
+                      <summary className={`${btn} w-full cursor-pointer justify-between font-normal text-ink-2`}>AI schedule priorities{scheduleProfile && <span className={tag}>Gemini</span>}</summary>
+                      <div className="mt-1.5 rounded-md border border-line p-2">
+                        <p className="mb-1.5 text-[12px] text-ink-3">Describe your real life. Gemini translates it into visible weights and hard unavailable times; Python still decides whether a schedule is valid.</p>
+                        <textarea className={`min-h-20 w-full resize-y rounded-md border border-line bg-canvas p-2 text-[12px] text-ink ${ring}`} value={schedulePrompt} onChange={e => setSchedulePrompt(e.target.value)} placeholder="Example: I work Tue/Thu 9–1, commute 50 minutes, hate long gaps, and don't want to be on campus more than 6 hours." />
+                        <div className="mt-1 flex flex-wrap gap-1">
+                          <button className={primary} disabled={preferenceLoading || !schedulePrompt.trim()} onClick={() => interpretSchedulePreferences()}>{preferenceLoading ? 'Asking Gemini…' : scheduleProfile ? 'Re-interpret' : 'Prioritize schedules'}</button>
+                          {scheduleProfile && <button className={btn} onClick={() => { setScheduleProfile(null); setSchedulePrompt(''); setScheduleFeedback(''); setFeedbackOpen(false); }}>Clear AI priorities</button>}
+                        </div>
+                        {scheduleProfile && <div className="mt-2 border-t border-line pt-2">
+                          <p className="mb-1 text-[12px] text-ink-2">{scheduleProfile.summary}</p>
+                          <div className="flex flex-wrap gap-1">
+                            {Object.entries(scheduleProfile.weights).filter(([, value]) => value > 0).map(([name, value]) => <span key={name} className={tag}>{WEIGHT_LABELS[name] ?? name}: {Math.round(value * 100)}%</span>)}
+                            {scheduleProfile.commuteMinutes !== null && <span className={tag}>Commute: {scheduleProfile.commuteMinutes} min</span>}
+                            {scheduleProfile.maxCampusSpanMinutes !== null && <span className={tag}>Preferred max day: {hours(scheduleProfile.maxCampusSpanMinutes)}</span>}
+                          </div>
+                          {scheduleProfile.availability && <div className="mt-1 text-[11px] text-ink-3">
+                            {(scheduleProfile.availability.earliest > 0 || scheduleProfile.availability.latest < 24 * 60) && <p>AI hard window: {clock(scheduleProfile.availability.earliest)}–{clock(scheduleProfile.availability.latest)}</p>}
+                            {scheduleProfile.availability.busy.length > 0 && <p>AI unavailable: {scheduleProfile.availability.busy.map(([day, start, end]) => `${day} ${clock(start)}–${clock(end)}`).join(' · ')}</p>}
+                          </div>}
+                        </div>}
+                      </div>
+                    </details>
                     {/* Availability — filters candidates to courses with a section the student can actually attend. */}
                     <details className="mb-1.5">
                       <summary className={`${btn} w-full cursor-pointer justify-between font-normal text-ink-2`}>

@@ -11,8 +11,9 @@ export type Term = { name: string; kind: 'Fall' | 'Spring' | 'Summer' | 'Winter'
 /** A real CUNYfirst class section. `start`/`end` are minutes past midnight; null for async/TBA. */
 export type Section = {
   sec: string; component: string; days: string; start: number | null; end: number | null;
-  extra: { days: string; start: number; end: number }[];
+  extra: { days: string; start: number | null; end: number | null }[];
   room: string; instr: string; mode: string; status: string; raw: string;
+  components?: Section[];
 };
 /** The student's weekly availability. Days are the 2-char CUNYfirst tokens: Mo Tu We Th Fr Sa Su. */
 export type Availability = { busy: [string, number, number][]; earliest: number; latest: number };
@@ -32,8 +33,25 @@ export type Progress = {
   }[];
   pathways: { slot: string; label: string; course: string | null }[];
 };
+export type ScheduleWeights = {
+  campus_days: number; gap_minutes: number; early_minutes: number; late_minutes: number; campus_span_minutes: number;
+};
+export type SchedulePreferenceProfile = {
+  summary: string; weights: ScheduleWeights; availability: Availability | null;
+  commuteMinutes: number | null; maxCampusSpanMinutes: number | null; source: 'gemini' | 'heuristic';
+};
+export type OptimizerSchedule = {
+  sections: { course_id: string; section: Section }[]; credits?: number; cost?: number; metrics: Record<string, number>;
+};
+export type OptimizerInfo = {
+  applied: boolean; count: number; limit: number; poolCourses: number; poolSections: number; openOnly: boolean;
+  schedules: OptimizerSchedule[]; profile: SchedulePreferenceProfile; effectiveAvailability: Availability | null;
+  ranking: string; reason?: string;
+};
+
 export type SuggestResponse = {
   suggested: Suggestion[]; candidates: Suggestion[]; progress: Progress; source: 'gemini' | 'heuristic'; violations: Violation[];
+  optimizer: OptimizerInfo;
   /** basis='published': the registrar has released this term's schedule. 'pattern': same season, a year on —
    *  a fair guide to when a course usually meets, but not a booking. null: no section data scraped. */
   schedule: { basis: 'published' | 'pattern'; scraped: string } | null;

@@ -2,6 +2,9 @@
 
     python backend/server.py            # http://localhost:8000
 
+POST /api/schedule-preferences  {"prompt": "...", "profile": {...}, "feedback": "..."}
+  -> Gemini-translated hard availability + bounded schedule-ranking weights
+
 POST /api/suggest  {"program": "CSCI-BS", "terms": [[courseId...]...], "term": "Fall"|"Spring"|"Summer"|"Winter",
                     "pins": [courseId...], "queue": [courseId...], "preferences": {"preferredSubjects": [],
                     "avoidedSubjects": []}, "fresh": bool, "ai": bool (default true; false = rule-based, no Gemini call)}
@@ -19,6 +22,7 @@ from collections import Counter
 from io import BytesIO
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from optimizer import bundle_components, explore_course_schedules
 
 ROOT = Path(__file__).resolve().parent
 for _l in (ROOT / ".env").read_text().splitlines() if (ROOT / ".env").exists() else []:   # ponytail: KEY=value lines, no quoting rules
@@ -606,6 +610,20 @@ def available(cid, term, avail):
     return [s for s in secs if fits(s, avail)] if avail else secs
 
 
+
+def schedulable_sections(cid, term, avail=None, open_only=True):
+    """Complete section choices the optimizer may actually register.
+
+    Unlike ``available()``, this filters CUNYfirst registration status when planning a
+    published term and bundles required lecture/lab/recitation rows into one option.
+    """
+    secs = available(cid, term, avail)
+    if not secs:
+        return []
+    if open_only:
+        secs = [s for s in secs if str(s.get("status", "")).strip().lower() == "open"]
+    return bundle_components(secs)
+
 def map_rank(program, cid):
     """Position in the official degree map (earlier = smaller) or 99."""
     for i, sem in enumerate(program["semesters"]):
@@ -622,6 +640,162 @@ def preference_subjects(preferences):
     preferred = clean("preferredSubjects")
     return preferred, clean("avoidedSubjects") - preferred
 
+
+
+SCHEDULE_WEIGHT_KEYS = (
+    "campus_days", "gap_minutes", "early_minutes", "late_minutes", "campus_span_minutes",
+)
+DAY_CODES = ("Mo", "Tu", "We", "Th", "Fr", "Sa", "Su")
+
+
+def sanitize_availability(raw):
+    """Validate a hard availability object before it reaches the scheduler."""
+    if not isinstance(raw, dict):
+        return None
+
+    def minute(value, default):
+        try:
+            return max(0, min(24 * 60, int(round(float(value)))))
+        except (TypeError, ValueError):
+            return default
+
+    earliest = minute(raw.get("earliest"), 0)
+    latest = minute(raw.get("latest"), 24 * 60)
+    busy = []
+    for item in raw.get("busy") or []:
+        if not isinstance(item, (list, tuple)) or len(item) != 3:
+            continue
+        day = str(item[0])
+        start, end = minute(item[1], -1), minute(item[2], -1)
+        if day in DAY_CODES and 0 <= start < end <= 24 * 60:
+            busy.append((day, start, end))
+    busy = sorted(set(busy), key=lambda b: (DAY_CODES.index(b[0]), b[1], b[2]))
+    return {"busy": busy, "earliest": earliest, "latest": latest}
+
+
+def merge_availability(manual, generated):
+    """Manual controls remain authoritative; Gemini can only add hard constraints."""
+    manual = sanitize_availability(manual)
+    generated = sanitize_availability(generated)
+    if not manual and not generated:
+        return None
+    if not manual:
+        return generated
+    if not generated:
+        return manual
+    return {
+        "busy": sorted(set(tuple(x) for x in manual["busy"] + generated["busy"]), key=lambda b: (DAY_CODES.index(b[0]), b[1], b[2])),
+        "earliest": max(manual["earliest"], generated["earliest"]),
+        "latest": min(manual["latest"], generated["latest"]),
+    }
+
+
+def sanitize_schedule_profile(raw):
+    """Bound every Gemini-controlled field before it can affect ranking."""
+    raw = raw if isinstance(raw, dict) else {}
+    source_name = raw.get("source")
+    source_name = source_name if source_name in ("gemini", "heuristic") else "heuristic"
+    weights_raw = raw.get("weights") if isinstance(raw.get("weights"), dict) else {}
+    weights = {}
+    for name in SCHEDULE_WEIGHT_KEYS:
+        try:
+            value = float(weights_raw.get(name, 0.0))
+        except (TypeError, ValueError):
+            value = 0.0
+        weights[name] = max(0.0, min(1.0, value))
+
+    def optional_minutes(name, low, high):
+        value = raw.get(name)
+        if value in (None, ""):
+            return None
+        try:
+            return max(low, min(high, int(round(float(value)))))
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "summary": str(raw.get("summary") or "")[:320],
+        "weights": weights,
+        "availability": sanitize_availability(raw.get("availability")),
+        "commuteMinutes": optional_minutes("commuteMinutes", 0, 360),
+        "maxCampusSpanMinutes": optional_minutes("maxCampusSpanMinutes", 60, 14 * 60),
+        "source": source_name,
+    }
+
+
+def interpret_schedule_preferences(body):
+    """Translate natural language or rejection feedback into a safe ranking profile.
+
+    This intentionally reuses the team's shared Gemini helper, so preference parsing,
+    semester generation, and Advisor chat use the same 3.7 -> 3.6 fallback behavior.
+    """
+    prompt_text = str(body.get("prompt") or "").strip()[:4000]
+    feedback = str(body.get("feedback") or "").strip()[:2000]
+    if not prompt_text and not feedback:
+        raise ValueError("Enter schedule preferences or feedback first.")
+    if not os.environ.get("GEMINI_API_KEY"):
+        raise RuntimeError("GEMINI_API_KEY is not configured.")
+    current = sanitize_schedule_profile(body.get("profile"))
+    rejected = body.get("scheduleMetrics")
+    rejected = rejected if isinstance(rejected, dict) else {}
+
+    request = f"""You translate a college student's natural-language scheduling preferences into a small numeric profile.
+Python, not you, enforces course eligibility, section availability, and time conflicts.
+
+SUPPORTED SOFT COST WEIGHTS (each 0.0 to 1.0; larger = more important to reduce):
+- campus_days: fewer days commuting to campus. A long commute should usually raise this.
+- gap_minutes: less idle time between classes.
+- early_minutes: less class time before 10:00 AM.
+- late_minutes: less class time after 5:00 PM.
+- campus_span_minutes: shorter first-class-to-last-class campus days.
+
+HARD AVAILABILITY:
+- Use day tokens Mo Tu We Th Fr Sa Su.
+- busy is a list like [["Tu", 540, 780]] meaning Tuesday 9:00 AM-1:00 PM.
+- earliest/latest are minutes after midnight.
+- Only use hard availability when the student explicitly says they cannot attend then (work, caregiving, appointment, "never", "can't", etc.). Mere dislikes belong in weights.
+- Do not turn commute time itself into a fake busy block. Commute is a ranking signal unless the student gives an actual cannot-attend interval.
+
+CAMPUS SPAN:
+- If the student gives a preferred maximum amount of time on campus in one day, set maxCampusSpanMinutes. It is a soft threshold: the optimizer penalizes only minutes beyond it.
+
+FEEDBACK:
+- If feedback is supplied, revise the CURRENT PROFILE to address why the shown schedule was rejected.
+- Use REJECTED SCHEDULE METRICS as evidence when helpful. "Too much waiting" should increase gap_minutes; "too many trips" should increase campus_days.
+- Return the entire replacement profile, not a patch.
+
+STUDENT PREFERENCE PROMPT:
+{prompt_text or "(none)"}
+
+CURRENT PROFILE:
+{json.dumps(current, sort_keys=True)}
+
+REJECTED SCHEDULE METRICS:
+{json.dumps(rejected, sort_keys=True)}
+
+STUDENT FEEDBACK:
+{feedback or "(none)"}
+
+Return ONLY this JSON object:
+{{
+  "summary": "one short plain-English explanation of what you prioritized",
+  "weights": {{"campus_days": 0.0, "gap_minutes": 0.0, "early_minutes": 0.0, "late_minutes": 0.0, "campus_span_minutes": 0.0}},
+  "availability": {{"busy": [], "earliest": 0, "latest": 1440}},
+  "commuteMinutes": null,
+  "maxCampusSpanMinutes": null
+}}
+"""
+    try:
+        parsed = json.loads(gemini([{"parts": [{"text": request}]}], json_out=True, temperature=0.2))
+    except Exception as exc:
+        raise RuntimeError(f"Gemini preference interpretation failed: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Gemini returned an invalid preference profile.")
+    parsed["source"] = "gemini"
+    profile = sanitize_schedule_profile(parsed)
+    if not profile["summary"]:
+        profile["summary"] = "Gemini translated your schedule preferences into optimizer weights."
+    return profile
 
 def candidates(program, taken, term, avail=None, preferences=None, audit_requirements=None):
     times = Counter(taken)            # multiplicity matters for credit-kind rules only
@@ -813,43 +987,126 @@ def unlocks(cid, base, program):
                   key=lambda o: (o not in major_ids, courses[o]["code"]))
 
 
+
+
+def optimized_schedules(cands, taken, terms, term, avail, locked=(), order=(), schedule_profile=None, limit=20):
+    """Search the full eligible pool for distinct conflict-free full-time terms."""
+    profile = sanitize_schedule_profile(schedule_profile)
+    ranked, seen = [], set()
+    for cand in [*locked, *order, *cands]:
+        if cand["id"] not in seen:
+            seen.add(cand["id"])
+            ranked.append(cand)
+
+    open_only = not bool(terms)
+    section_map, meta = {}, {}
+    for cand in ranked:
+        cid = cand["id"]
+        choices = schedulable_sections(cid, term, avail, open_only=open_only)
+        if not choices:
+            continue
+        section_map[cid] = choices
+        meta[cid] = {"credits": courses[cid]["credits"], "subject": courses[cid]["subject"], "key": cand["key"]}
+
+    required = [c["id"] for c in locked]
+    missing_required = [cid for cid in required if cid not in section_map]
+    info = {
+        "applied": False, "count": 0, "limit": limit,
+        "poolCourses": len(section_map), "poolSections": sum(len(v) for v in section_map.values()),
+        "openOnly": open_only, "schedules": [], "profile": profile,
+        "effectiveAvailability": avail,
+        "ranking": "weighted-explored-pool" if any(profile["weights"].values()) else "neutral",
+    }
+    if missing_required:
+        info["reason"] = "A pinned course has no usable section for this term."
+        return [], info
+
+    current_term_index = len(terms)
+    def academically_valid(ids):
+        problems = validate([*terms, list(ids)])
+        return not any(v["term"] == current_term_index for v in problems)
+
+    schedules = explore_course_schedules(
+        section_map, meta, required=required, min_courses=MIN_COURSES,
+        target_credits=TARGET_CREDITS, max_credits=MAX_CREDITS, max_courses=7,
+        limit=limit, valid_course_set=academically_valid, open_only=open_only,
+        weights=profile["weights"], max_campus_span_minutes=profile["maxCampusSpanMinutes"], ranking_pool=80,
+    )
+    info["applied"] = bool(schedules)
+    info["count"] = len(schedules)
+    info["schedules"] = schedules
+    if not schedules:
+        info["reason"] = "No full-time conflict-free schedule was found in the usable candidate pool."
+    return schedules, info
+
+
 _cache = {}   # ponytail: in-memory, per process; inputs include availability/preferences. Restart clears it.
 
 
 def suggest(body):
     program = programs[body["program"]]
     term = body.get("term", "Fall")
-    terms = body.get("terms") or ([body["taken"]] if body.get("taken") else [])   # ordered approved terms (or a flat list)
-    times = Counter(i for t in terms for i in t)   # multiplicity: repeated courses count toward credit rules
+    terms = body.get("terms") or ([body["taken"]] if body.get("taken") else [])
+    times = Counter(i for t in terms for i in t)
     taken = set(times)
-    avail = body.get("avail") or None
+    manual_avail = body.get("avail") or None
+    schedule_profile = sanitize_schedule_profile(body.get("scheduleProfile"))
+    avail = merge_availability(manual_avail, schedule_profile.get("availability"))
     preferences = body.get("preferences") or None
     preferred, avoided = preference_subjects(preferences)
     audit_requirements = audit_reqs(body)
     cands, progress = candidates(program, times, term, avail, preferences, audit_requirements)
     valid = {c["id"]: c for c in cands}
     locked = [valid[i] for i in dict.fromkeys(body.get("pins", []) + body.get("queue", [])) if i in valid]
-    ai = bool(body.get("ai", True))                              # ai=false: rule-based only, never spends Gemini credits
+    ai = bool(body.get("ai", True))
     key = (body["program"], tuple(tuple(t) for t in terms), term, tuple(c["id"] for c in locked), ai,
-           json.dumps(avail, sort_keys=True), tuple(sorted(preferred)), tuple(sorted(avoided)),
-           json.dumps(audit_requirements, sort_keys=True))
+           json.dumps(manual_avail, sort_keys=True), json.dumps(schedule_profile, sort_keys=True),
+           tuple(sorted(preferred)), tuple(sorted(avoided)), json.dumps(audit_requirements, sort_keys=True))
     if not body.get("fresh") and key in _cache:
         return _cache[key]
     lcr = sum(courses[c["id"]]["credits"] for c in locked)
     order = None if not ai or (lcr >= TARGET_CREDITS and len(locked) >= MIN_COURSES) else gemini_order(program, term, cands, locked, progress, avail, preferences)
-    picked = pick(cands, taken, locked, order or ())
+
+    # The teammate's ai flag controls Gemini *course ordering*. The deterministic
+    # section optimizer runs independently and can use a previously interpreted
+    # scheduleProfile without making another Gemini call.
+    if terms:
+        schedule_options = []
+        optimizer_info = {
+            "applied": False, "count": 0, "limit": 20,
+            "poolCourses": 0, "poolSections": 0, "openOnly": False, "schedules": [],
+            "reason": "Future pattern term keeps the academic course planner; no live section optimization applied.",
+            "profile": schedule_profile, "effectiveAvailability": avail, "ranking": "academic-pattern",
+        }
+    else:
+        schedule_options, optimizer_info = optimized_schedules(cands, taken, terms, term, avail, locked, order or (), schedule_profile, limit=20)
+
+    if schedule_options:
+        picked = []
+        selected_by_id = {item["course_id"]: item for item in schedule_options[0]["sections"]}
+        proposal_order = list(dict.fromkeys(c["id"] for c in [*locked, *(order or ()), *cands]))
+        for cid in proposal_order:
+            item = selected_by_id.get(cid)
+            if not item:
+                continue
+            c = valid[cid]
+            selected = item["section"]
+            component_secs = {str(s.get("sec", "")) for s in (selected.get("components") or [selected])}
+            alternatives = [s for s in (c.get("sections") or []) if str(s.get("sec", "")) not in component_secs]
+            c["sections"] = [selected, *alternatives[:5]]
+            picked.append(c)
+    else:
+        picked = pick(cands, taken, locked, order or ())
+
     base = taken | {c["id"] for c in picked}
-    for c in cands:                                    # recompute against the chosen term (candidates() used taken only)
+    for c in cands:
         c["unlocks"] = unlocks(c["id"], base, program)
     strip = lambda c: {k: v for k, v in c.items() if k not in ("score", "key")}
     out = {"suggested": [strip(c) for c in picked], "candidates": [strip(c) for c in cands], "progress": progress,
-           "source": "gemini" if order else "heuristic", "violations": validate(terms),
-           # only the next term maps to a schedule the registrar has actually published; terms after it reuse
-           # the same season's pattern, which is a fair guide but is not a booking. Say which, never imply both.
+           "source": "gemini" if order else "heuristic", "optimizer": optimizer_info, "violations": validate(terms),
            "schedule": {"basis": "published" if not terms else "pattern", "scraped": _meta.get("scraped")} if sections else None}
     _cache[key] = out
     return out
-
 
 def gemini(contents, system=None, json_out=False, temperature=0.4, model=MODEL):
     """One generateContent call; returns the text or raises. `contents` is the Gemini turn list."""
@@ -982,6 +1239,13 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._send({"error": str(e)}, 400)
         body = json.loads(raw or b"{}")
+        if self.path == "/api/schedule-preferences":
+            try:
+                return self._send(interpret_schedule_preferences(body))
+            except ValueError as e:
+                return self._send({"error": str(e)}, 400)
+            except RuntimeError as e:
+                return self._send({"error": str(e)}, 503)
         if self.path == "/api/suggest" and body.get("program") in programs:
             return self._send(suggest(body))
         if self.path == "/api/chat" and body.get("program") in programs:
